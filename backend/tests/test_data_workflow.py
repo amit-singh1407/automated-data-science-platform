@@ -1,6 +1,6 @@
 import pandas as pd
 
-from app.services.cleaning import apply_ecp_rules, apply_general_cleaning_rules
+from app.services.ecp import run_ecp
 from app.services.profiling import build_profile
 from app.services.transformation import transform_features
 
@@ -15,13 +15,16 @@ def test_profile_cleaning_and_transformation_preserve_auditability():
     )
 
     profile = build_profile(frame)
-    ecp_frame, ecp_audit, _ = apply_ecp_rules(frame)
-    cleaned_frame, general_audit, _ = apply_general_cleaning_rules(ecp_frame)
-    transformed_frame, transformation = transform_features(cleaned_frame)
+    ecp = run_ecp(frame)
+    transformed_frame, transformation = transform_features(ecp.cleaned)
 
     assert profile["duplicate_rows"] == 1
-    assert any(entry.get("stage") == 7 for entry in ecp_audit)
-    assert any(entry["rule"] == "impute_numeric_median" for entry in general_audit)
+    assert ecp.summary["rows"]["moved"]["duplicates"] == 1
+    # After removing the duplicate, 1 of 3 amounts is blank (33%): too many to
+    # fill safely, so it is reported instead of invented.
+    assert any(case["column"] == "amount" for case in ecp.summary["uncertain_cases"])
+    assert any(entry["action"] == "standardise" for entry in ecp.summary["audit_log_sample"])
+    assert {"old_value", "new_value", "reason"} <= set(ecp.audit.columns)
     assert "order_date_year" in transformed_frame.columns
     assert transformation["steps"]
 

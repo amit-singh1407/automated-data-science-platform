@@ -32,10 +32,17 @@ The following functionality is implemented:
 - Password validation between 8 and 128 characters.
 - Bcrypt password hashing and verification.
 - Signed JWT bearer tokens with configurable expiration.
-- Bearer-token validation on protected endpoints.
-- Job ownership checks for status, results, history, audit logs, performance
-  data, and artifact downloads.
-- Logout in the frontend by clearing the active client session.
+- `GET /api/v1/auth/me` for the logged-in user's email.
+- Every jobs endpoint requires a valid bearer token; a missing, invalid or
+  expired token gives 401.
+- Job ownership checks for upload, status, results, history, audit logs,
+  performance data, downloads and deletion. Another user's job gives the same
+  404 as a missing one, and bulk delete ignores IDs the user does not own.
+- Jobs uploaded before login was required belong to a placeholder user; the
+  first account registered takes them over. The placeholder cannot log in.
+- Frontend login and registration screen. The token is kept in local storage,
+  sent with every request, and cleared on logout; when the server rejects it,
+  the user returns to the login screen with a message.
 
 Configuration is loaded from environment variables using the `AUTODATA_`
 prefix. The configurable values include the database path, upload directory,
@@ -94,20 +101,40 @@ The quality score is explicitly a data-quality indicator, not model prediction
 accuracy. Profiles are cached by dataset fingerprint and cache version so
 reprocessing identical input can reuse the profile.
 
-### 4.3 Explainable Cleaning
+### 4.3 ECP Cleaning (S1-S7)
 
-Cleaning is split into two auditable rule sets:
+Cleaning is the E-commerce Cleaning Pipeline (ECP) from the thesis,
+implemented in `backend/app/services/ecp/`. It recognises the UCI Online
+Retail columns (InvoiceNo, StockCode, Description, Quantity, InvoiceDate,
+UnitPrice, CustomerID, Country) and common alternative names.
 
-- **ECP rules:** schema inspection, duplicate removal, text whitespace
-  normalization, ambiguous-missingness flags, ecommerce-field validation
-  markers, dependency-preservation markers, numeric-range validation markers,
-  and finalization.
-- **General rules:** median imputation for numeric missing values and mode
-  imputation for categorical missing values.
+| Stage | What it does |
+| --- | --- |
+| S1 Profile | Counts types, blanks and distinct values; makes IDs text, quantities and prices numbers, dates dates. |
+| S2 Standardise | Trims and collapses spaces; upper-cases invoice, stock code and description; maps countries with an alias table and fuzzy matching (similarity >= 0.85 and target >= 20x more frequent); real country names are never fuzzy-matched, so Iceland is not merged into Ireland. |
+| S3 Deduplicate | Removes exact duplicates after S2, so near-duplicates are caught too. |
+| S4 Shop rules | Moves returns (C invoices), adjustments (A invoices, adjustment codes, negative quantity without price) and fees (POST, DOT, ..., plus any stock code that is not a 5-digit product code, such as gift vouchers, when at least 90% of codes follow that format) to side tables; makes negative quantities on priced sales positive; treats zero prices as missing. |
+| S5 Dependencies | Tests invoice->customer, invoice->country, product->description, customer->country; uses a rule only if >= 90% of rows follow it, then fills blanks and fixes minority values. Guest orders (no customer anywhere on the invoice) stay blank. |
+| S6 Unusual values | Log-scale modified z-score (threshold 3.5) per product, and per guest/account for prices. A value seen >= 8 times, or a quantity normal for the customer, is genuine. Decimal slips are repaired only to a price charged >= 2 times; anything else goes to review. Quantities are flagged, never changed. |
+| S7 Fill and validate | Fills missing prices from the same product on the same day, then the same customer, then overall; runs quality checks. |
 
-Every applied action records its rule set, rule name, column where applicable,
-affected-row count, and reason. Cases that cannot be safely inferred are
-reported as `uncertain_cases` instead of being silently modified.
+Every change is recorded with stage, row (1-based row in the uploaded file),
+column, action, old value, new value and reason. Settings are in
+`ECPConfig` (`ecp/config.py`); defaults follow the thesis. The minimum group
+size for z-scores (5) is an implementation choice not stated in the thesis.
+
+Datasets without the order columns run in **generic mode**: S1 (profile
+only), S2 (trim spaces), S3, then a general fill (median or most common
+value) that is not part of ECP; S4-S6 are skipped. Columns more than 30%
+blank are reported, not filled.
+
+On the real UCI Online Retail data (541,909 rows) ECP takes about 15 seconds
+on the development machine and reproduces the thesis figures for S1-S5 and S7
+exactly: 523,660 sales lines, 132,477 guest lines kept, 133,102 text cells
+standardised, 6,712 descriptions repaired and 570 filled, no fuzzy country
+changes, no outlier repairs, and 126,012 of value added by filling missing
+prices. The S6 review queue differs (7,845 rows against 5,795 in the thesis)
+because the thesis does not fully specify the S6 rules (see ECPConfig).
 
 Before-and-after quality scores and the quality change are persisted with the
 job.
@@ -148,8 +175,14 @@ and audit data as JSON in SQLite. The pipeline also generates:
 - `original.<extension>`
 - `cleaned.<extension>`
 - `transformed.<extension>`
-- `audit-log.json`
+- `audit-log.csv` (every ECP change; jobs from before ECP have `audit-log.json`)
+- `review.csv` (rows flagged for review, with the reason)
+- `side-returns.csv`, `side-fees.csv`, `side-adjustments.csv`,
+  `side-duplicates.csv` (rows moved out of the sales data, when present)
 - `report.pdf`
+
+The results JSON holds the ECP summary plus samples of the audit log and
+review queue; the full logs are in the CSV files.
 
 The PDF report contains the job ID, dataset dimensions, quality score, cleaning
 action count, uncertain-case count, quality change, ML mode, winning model, and
@@ -160,7 +193,8 @@ Each major processing stage records:
 - Stage name.
 - Start timestamp.
 - Duration in milliseconds.
-- Peak traced memory.
+- Peak traced memory (only when `AUTODATA_TRACE_MEMORY=true`; tracing makes
+  the pipeline several times slower, so it is off by default and reported as 0).
 - Number of rows processed.
 
 The telemetry is available through:
@@ -178,6 +212,7 @@ analysis stages for configurable row counts and repetitions.
 
 - `POST /api/v1/auth/register`
 - `POST /api/v1/auth/login`
+- `GET /api/v1/auth/me`
 
 ### Jobs
 
@@ -190,41 +225,46 @@ analysis stages for configurable row counts and repetitions.
 - `GET /api/v1/jobs/{job_id}/download/{artifact}`
 
 Supported download artifacts are `original`, `cleaned`, `transformed`,
-`report`, and `log`. Downloads are authenticated and ownership-checked; raw
-filesystem paths are not returned to the frontend.
+`report`, `log`, `review`, `returns`, `fees`, `adjustments`,
+`duplicates` and `all` (a ZIP of every file). Raw filesystem paths are not
+returned to the frontend. `GET /api/v1/jobs/history` also returns rows,
+quality before and after cleaning, and total duration per job.
+
 
 ## 7. Implemented Frontend Workspace
 
-The React application includes these navigable workspace sections:
+The React application (`frontend/src/`) has one file per page in `pages/`,
+shared components in `components/`, and the app shell in `App.tsx`:
 
-1. Dashboard
-2. Dataset Upload
-3. Data Profiling
-4. Automated Cleaning
-5. Data Transformation
-6. Machine Learning
-7. Visual Analytics
-8. Audit Logs
-9. Reports & Downloads
-10. Job History
+1. Dashboard: upload (click or drag and drop), job counts, average quality
+   after cleaning, recent datasets, and pipeline progress per step.
+2. Data Profiling: types, blanks, numeric summary, common text values.
+3. ECP Cleaning: S1-S7 with counts and details per stage, the S5 dependency
+   rules and their support, invoice totals, and the S7 validation checks.
+4. Audit Log: every change (old value, new value, reason) with stage, action
+   and text filters; the review queue; open issues.
+5. Data Transformation: steps applied and the resulting columns.
+6. Machine Learning: accuracy, precision, recall, F1, ROC AUC, MCC, the
+   confusion matrix and ROC curve (classification); R², RMSE, MAE and actual
+   vs predicted (regression); clusters, silhouette per k, cluster profiles and
+   anomalies (clustering). The reason is shown when no model was trained.
+7. Visual Analytics: blank values before and after cleaning, what each ECP
+   stage did, a distribution per numeric column, and the correlation heatmap.
+8. Performance: time per pipeline stage and per ECP stage.
+9. Reports & Downloads: every artifact the job produced, plus a ZIP of all.
+10. Job History: rows, quality before and after, duration, search, filters,
+    per-job download and delete.
 
-The frontend implements:
+Every number shown comes from the backend; a value that was not calculated
+is shown as "—". Pages render through `JobGate`, which handles the no-job,
+queued, processing, failed and loading states, so a page cannot crash when
+a job finishes while it is open. Jobs processed before ECP show a message
+asking for a re-upload instead of empty sections. Plotly is loaded only when
+the first chart is shown.
 
-- Login and registration forms with API error display.
-- Authenticated dataset upload.
-- Automatic job-history refresh after upload.
-- Polling until a job completes or fails.
-- Progress percentage and stage messages.
-- Loading of results and audit logs after completion.
-- JSON result views for profile, cleaning, transformation, and ML sections.
-- Plotly visualizations for missing values, quality, outliers, cleaning
-  summaries, and ML results.
-- Authenticated downloads for all generated artifacts.
-- Job selection and historical-job review.
-
-The API client centralizes authentication, upload, history, status, results,
-audit-log, and artifact-download requests. Its default API base is
-`/api/v1`, with `VITE_API_BASE_URL` available for deployment overrides.
+The API client centralizes upload, history, status, results, performance,
+artifact-download and delete requests. Its default API base is `/api/v1`,
+with `VITE_API_BASE_URL` available for deployment overrides.
 
 ## 8. Verification Currently Present
 

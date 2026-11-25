@@ -41,7 +41,11 @@ def save_upload(file: UploadFile, job_id: str) -> Path:
 def load_dataframe(path: Path) -> pd.DataFrame:
     extension = path.suffix.lower()
     if extension == ".csv":
-        return pd.read_csv(path)
+        # Many exports (including the UCI Online Retail CSV) are Latin-1, not UTF-8.
+        try:
+            return pd.read_csv(path, low_memory=False)
+        except UnicodeDecodeError:
+            return pd.read_csv(path, low_memory=False, encoding="latin-1")
     if extension == ".xls":
         return pd.read_excel(path, engine="xlrd")
     if extension == ".xlsx":

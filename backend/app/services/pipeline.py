@@ -4,11 +4,12 @@ import json
 import sqlite3
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from app.core.config import settings
 from app.db.database import initialize_database
-from app.services.cleaning import apply_ecp_rules, apply_general_cleaning_rules
+from app.services.ecp import run_ecp
 from app.services.file_storage import load_dataframe, save_dataframe
 from app.services.ml import run_automl
 from app.services.profiling import build_profile
@@ -21,42 +22,82 @@ from app.services.transformation import transform_features
 def _update_progress(db: sqlite3.Connection, job_id: str, progress: int, message: str) -> None:
     db.execute(
         "UPDATE jobs SET progress = ?, progress_message = ?, updated_at = ? WHERE id = ?",
-        (progress, message, pd.Timestamp.utcnow().isoformat(), job_id),
+        (progress, message, pd.Timestamp.now("UTC").isoformat(), job_id),
     )
     db.commit()
 
 
-def _build_visualizations(profile: dict, cleaning: dict, ml: dict) -> dict:
-    missing_items = [{"column": key, "missing": value} for key, value in profile["missing_values"].items()]
-    visuals = {
-        "missing_values_bar": {
-            "type": "bar",
-            "x": [item["column"] for item in missing_items],
-            "y": [item["missing"] for item in missing_items],
+MAX_CHART_COLUMNS = 12
+
+
+def _numeric_columns(df: pd.DataFrame) -> list:
+    numeric = df.select_dtypes(include="number")
+    varying = [column for column in numeric.columns if numeric[column].nunique(dropna=True) > 1]
+    return varying[:MAX_CHART_COLUMNS]
+
+
+def _correlation(df: pd.DataFrame) -> dict | None:
+    columns = _numeric_columns(df)
+    if len(columns) < 2:
+        return None
+    matrix = df[columns].astype("float64").corr().round(3)
+    return {
+        "columns": [str(c) for c in columns],
+        "matrix": [[None if pd.isna(v) else float(v) for v in row] for row in matrix.to_numpy()],
+    }
+
+
+def _distributions(df: pd.DataFrame, bins: int = 20) -> dict:
+    """Histogram per numeric column. Values outside the 1st-99th percentile
+    are left out (and counted) so one extreme value does not flatten the chart."""
+    result: dict = {}
+    for column in _numeric_columns(df):
+        values = df[column].astype("float64").replace([np.inf, -np.inf], np.nan).dropna()
+        if values.empty:
+            continue
+        low, high = values.quantile([0.01, 0.99])
+        if low == high:
+            low, high = values.min(), values.max()
+        inside = values[(values >= low) & (values <= high)]
+        counts, edges = np.histogram(inside, bins=bins)
+        result[str(column)] = {
+            "edges": [round(float(e), 6) for e in edges],
+            "counts": [int(c) for c in counts],
+            "excluded_extremes": int(len(values) - len(inside)),
+        }
+    return result
+
+
+def _build_visualizations(profile: dict, cleaned_profile: dict, cleaning: dict, clean_df: pd.DataFrame) -> dict:
+    missing_before = profile["missing_values"]
+    missing_after = cleaned_profile["missing_values"]
+    return {
+        "missing_values": {
+            "columns": list(missing_before),
+            "before": [missing_before[c] for c in missing_before],
+            "after": [missing_after.get(c, 0) for c in missing_before],
+            "rows_before": profile["rows"],
+            "rows_after": cleaned_profile["rows"],
         },
-        "quality_gauge": {"type": "gauge", "value": profile["quality_score"], "max": 100},
         "quality_comparison": {
             "before": cleaning["before_after_quality"]["before"],
             "after": cleaning["before_after_quality"]["after"],
             "change": cleaning["before_after_quality"]["change"],
         },
-        "outlier_bar": {
-            "type": "bar",
-            "x": list(profile.get("unusual_numeric_values", {}).keys()),
-            "y": list(profile.get("unusual_numeric_values", {}).values()),
+        "unusual_values": {
+            "method": "IQR rule on the uploaded data (1.5 x IQR), whole column at once",
+            "columns": list(profile.get("unusual_numeric_values", {})),
+            "counts": list(profile.get("unusual_numeric_values", {}).values()),
         },
         "cleaning_summary": {
-            "type": "pie",
-            "labels": ["ECP Rules", "General Rules", "Uncertain"],
-            "values": [
-                len([a for a in cleaning["audit_log"] if a["rule_set"] == "ecp"]),
-                len([a for a in cleaning["audit_log"] if a["rule_set"] == "general"]),
-                len(cleaning["uncertain_cases"]),
-            ],
+            "labels": [f"{stage['stage']} {stage['name']}" for stage in cleaning["stages"]],
+            "cells_changed": [stage.get("cells_changed", 0) for stage in cleaning["stages"]],
+            "rows_moved_or_removed": [stage.get("rows_moved_or_removed", 0) for stage in cleaning["stages"]],
+            "rows_flagged": [stage.get("rows_flagged", 0) for stage in cleaning["stages"]],
         },
-        "ml_summary": ml,
+        "correlation": _correlation(clean_df),
+        "distributions": _distributions(clean_df),
     }
-    return visuals
 
 
 def _job_artifact_paths(job_id: str, original_path: Path) -> dict[str, Path]:
@@ -68,7 +109,8 @@ def _job_artifact_paths(job_id: str, original_path: Path) -> dict[str, Path]:
         "cleaned": job_dir / f"cleaned{output_extension}",
         "transformed": job_dir / f"transformed{output_extension}",
         "report": job_dir / "report.pdf",
-        "log": job_dir / "audit-log.json",
+        "log": job_dir / "audit-log.csv",
+        "review": job_dir / "review.csv",
     }
 
 
@@ -96,7 +138,7 @@ def process_job(job_id: str) -> None:
         db.execute(
             "INSERT OR REPLACE INTO dataset_fingerprints "
             "(job_id, content_hash, file_size_bytes, created_at) VALUES (?, ?, ?, ?)",
-            (job_id, fingerprint, original_path.stat().st_size, pd.Timestamp.utcnow().isoformat()),
+            (job_id, fingerprint, original_path.stat().st_size, pd.Timestamp.now("UTC").isoformat()),
         )
         db.commit()
         stages: list[dict[str, object]] = []
@@ -116,17 +158,25 @@ def process_job(job_id: str) -> None:
         )
         _update_progress(db, job_id, 25, "Profiling dataset")
 
+        _update_progress(db, job_id, 30, "Cleaning with ECP (S1-S7)")
         with measure_stage("cleaning", len(df)) as measurement:
-            ecp_df, ecp_audit, ecp_uncertain = apply_ecp_rules(df)
-            clean_df, gen_audit, gen_uncertain = apply_general_cleaning_rules(ecp_df)
+            ecp = run_ecp(df)
+            clean_df = ecp.cleaned
             cleaned_profile = build_profile(clean_df)
         stages.append(measurement)
-        _update_progress(db, job_id, 45, "Applying cleaning rules")
+        _update_progress(db, job_id, 45, "ECP cleaning complete")
+        summary = ecp.summary
+        general_changes = next(
+            (stage.get("cells_changed", 0) for stage in summary["stages"]
+             if stage["stage"] == "S7" and summary["mode"] == "generic"),
+            0,
+        )
         cleaning_result = {
-            "audit_log": ecp_audit + gen_audit,
-            "uncertain_cases": ecp_uncertain + gen_uncertain,
-            "ecp_summary": {"rules_applied": len(ecp_audit)},
-            "general_summary": {"rules_applied": len(gen_audit)},
+            **summary,
+            # Kept for the current UI, which reads these keys.
+            "audit_log": summary["audit_log_sample"],
+            "ecp_summary": {"rules_applied": summary["cells_changed"] - general_changes},
+            "general_summary": {"rules_applied": general_changes},
             "before_after_quality": {
                 "before": profile["quality_score"],
                 "after": cleaned_profile["quality_score"],
@@ -146,12 +196,15 @@ def process_job(job_id: str) -> None:
             ml_result = run_automl(transformed_df)
         stages.append(measurement)
         _update_progress(db, job_id, 75, "Running automated analysis")
-        visualizations = _build_visualizations(profile, cleaning_result, ml_result)
+        visualizations = _build_visualizations(profile, cleaned_profile, cleaning_result, clean_df)
 
         with measure_stage("artifacts", len(transformed_df)) as measurement:
             save_dataframe(clean_df, artifacts["cleaned"])
             save_dataframe(transformed_df, artifacts["transformed"])
-            artifacts["log"].write_text(json.dumps(cleaning_result["audit_log"], indent=2), encoding="utf-8")
+            ecp.audit.to_csv(artifacts["log"], index=False)
+            ecp.review.to_csv(artifacts["review"], index=False)
+            for name, table in ecp.side_tables.items():
+                table.to_csv(job_dir / f"side-{name}.csv", index=False)
             write_pdf_report(artifacts["report"], job_id, profile, cleaning_result, ml_result)
         stages.append(measurement)
         db.executemany(
@@ -182,9 +235,9 @@ def process_job(job_id: str) -> None:
             (
                 json.dumps(profile), json.dumps(cleaning_result), json.dumps(transform_details),
                 json.dumps(ml_result), json.dumps(visualizations),
-                json.dumps(cleaning_result["audit_log"] + [{"rule_set": "system", **audit_metadata}]),
+                json.dumps(summary["audit_log_sample"] + [{"stage": "system", **audit_metadata}]),
                 "completed", None,
-                pd.Timestamp.utcnow().isoformat(), job_id,
+                pd.Timestamp.now("UTC").isoformat(), job_id,
             ),
         )
         _update_progress(db, job_id, 100, "Completed")
@@ -196,7 +249,7 @@ def process_job(job_id: str) -> None:
         if job:
             db.execute(
                 "UPDATE jobs SET status = ?, error_message = ?, updated_at = ? WHERE id = ?",
-                ("failed", str(exc), pd.Timestamp.utcnow().isoformat(), job_id),
+                ("failed", str(exc), pd.Timestamp.now("UTC").isoformat(), job_id),
             )
             db.commit()
     finally:

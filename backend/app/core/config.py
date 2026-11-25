@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     sqlite_path: str = str(BACKEND_ROOT / "autodata.db")
     uploads_root: str = str(BACKEND_ROOT / "uploads")
     allowed_extensions: tuple[str, ...] = (".csv", ".xls", ".xlsx", ".parquet")
+    # Record peak memory per stage with tracemalloc. Accurate but makes the
+    # pipeline several times slower, so off by default.
+    trace_memory: bool = False
 
     model_config = SettingsConfigDict(env_file=BACKEND_ROOT / ".env", env_prefix="AUTODATA_")
 

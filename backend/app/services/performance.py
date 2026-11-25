@@ -36,16 +36,32 @@ class StageMeasurement:
 
 
 @contextmanager
-def measure_stage(stage: str, rows_processed: int) -> Iterator[dict[str, object]]:
+def measure_stage(
+    stage: str, rows_processed: int, trace_memory: bool | None = None
+) -> Iterator[dict[str, object]]:
+    """Time a stage and, if enabled, record its peak traced memory.
+
+    Memory tracing (tracemalloc) slows pandas-heavy stages several times over
+    (measured: ECP on 547k rows takes 12 s untraced vs 56 s traced), so it is
+    off by default. Enable it with AUTODATA_TRACE_MEMORY=true; when off,
+    peak memory is reported as 0.
+    """
+    if trace_memory is None:
+        from app.core.config import settings
+
+        trace_memory = settings.trace_memory
     started_at = datetime.now(timezone.utc).isoformat()
-    tracemalloc.start()
+    if trace_memory:
+        tracemalloc.start()
     started = perf_counter()
     measurement: dict[str, object] = {}
     try:
         yield measurement
     finally:
-        _, peak_memory = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
+        peak_memory = 0
+        if trace_memory:
+            _, peak_memory = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
         measurement.update(
             stage=stage,
             started_at=started_at,

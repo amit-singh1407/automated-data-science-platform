@@ -18,6 +18,15 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
 
 
+class UserResponse(BaseModel):
+    id: str
+    email: str
+
+
+class DeleteJobsRequest(BaseModel):
+    job_ids: list[str] = Field(min_length=1, max_length=500)
+
+
 class JobStatusResponse(BaseModel):
     job_id: str
     status: str
@@ -46,6 +55,12 @@ class JobHistoryItem(BaseModel):
     status: str
     created_at: datetime
     updated_at: datetime
+    progress: int = 0
+    error_message: str | None = None
+    rows: int | None = None
+    quality_before: float | None = None
+    quality_after: float | None = None
+    duration_ms: float | None = None
 
 
 class JobStageResponse(BaseModel):

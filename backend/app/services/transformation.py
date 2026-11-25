@@ -30,10 +30,19 @@ def transform_features(df: pd.DataFrame, target_column: str | None = None) -> tu
             }
         )
 
-    for col in transformed.select_dtypes(include=["object", "string"]).columns.tolist():
+    date_candidates = transformed.select_dtypes(include=["object", "string", "datetime", "datetimetz"]).columns
+    for col in date_candidates.tolist():
         if col == target_column:
             continue
-        parsed = pd.to_datetime(transformed[col], format="mixed", errors="coerce")
+        if pd.api.types.is_datetime64_any_dtype(transformed[col]):
+            parsed = transformed[col]
+        else:
+            # Parsing every value of every text column is very slow on large
+            # files, so first check whether a sample looks like dates at all.
+            sample = transformed[col].dropna().head(200)
+            if sample.empty or pd.to_datetime(sample, format="mixed", errors="coerce").notna().mean() < 0.8:
+                continue
+            parsed = pd.to_datetime(transformed[col], format="mixed", errors="coerce")
         if parsed.notna().mean() >= 0.8:
             transformed[f"{col}_year"] = parsed.dt.year
             transformed[f"{col}_month"] = parsed.dt.month

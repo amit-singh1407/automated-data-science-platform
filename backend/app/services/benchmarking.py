@@ -7,7 +7,7 @@ from time import perf_counter
 
 import pandas as pd
 
-from app.services.cleaning import apply_ecp_rules, apply_general_cleaning_rules
+from app.services.ecp import run_ecp
 from app.services.ml import run_automl
 from app.services.performance import measure_stage, runtime_metadata
 from app.services.profiling import build_profile
@@ -30,8 +30,7 @@ def run_benchmark(row_count: int, repetitions: int = 1) -> dict:
             profile = build_profile(frame)
         stages.append(measurement)
         with measure_stage("cleaning", len(frame)) as measurement:
-            ecp_frame, _, _ = apply_ecp_rules(frame)
-            cleaned_frame, _, _ = apply_general_cleaning_rules(ecp_frame)
+            cleaned_frame = run_ecp(frame).cleaned
         stages.append(measurement)
         with measure_stage("transformation", len(cleaned_frame)) as measurement:
             transformed_frame, _ = transform_features(cleaned_frame)
